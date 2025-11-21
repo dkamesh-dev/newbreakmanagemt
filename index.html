@@ -1,124 +1,237 @@
-<script type="module">
-  // === 1️⃣ Firebase Setup ===
-  import { initializeApp } from "https://www.gstatic.com/firebasejs/11.0.1/firebase-app.js";
-  import { getDatabase, ref, set, onValue, update, get } from "https://www.gstatic.com/firebasejs/11.0.1/firebase-database.js";
+/break-tracker
+├── server.js
+├── package.json
+├── data.json
+├── users.json
+└── /public
+├── login.html
+├── signup.html
+├── dashboard.html
+├── style.css
+└── app.js
 
-  const firebaseConfig = {
-    apiKey: "YOUR_FIREBASE_API_KEY",
-    authDomain: "YOUR_PROJECT.firebaseapp.com",
-    databaseURL: "https://YOUR_PROJECT.firebaseio.com",
-    projectId: "YOUR_PROJECT",
-    storageBucket: "YOUR_PROJECT.appspot.com",
-    messagingSenderId: "YOUR_SENDER_ID",
-    appId: "YOUR_APP_ID"
-  };
+=============================
+📌 **server.js**
+================
 
-  const appFB = initializeApp(firebaseConfig);
-  const db = getDatabase(appFB);
+````js
+const express = require('express');
+const fs = require('fs');
+const path = require('path');
+const http = require('http');
+const { Server } = require('socket.io');
+const cors = require('cors');
 
-  // === 2️⃣ Existing app logic ===
-  const teamMembers = [
-    { name:"Asha AS", email:"asha.as@opendoor.com", empid:"010293" },
-    { name:"Revathi Kumar", email:"revathi.kumar@opendoor.com", empid:"010113" },
-    { name:"Kamesh D", email:"d.kamesh@opendoor.com", empid:"010193" }
-    // ... add rest of your members
-  ];
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: '*' } });
 
-  const app = document.getElementById("app");
+app.use(cors());
+app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
 
-  // --- Local helpers ---
-  function getCurrentEmpid() { return localStorage.getItem('bt_current_empid'); }
-  function setCurrentEmpid(id){ localStorage.setItem('bt_current_empid', id); }
-  function clearCurrentEmpid(){ localStorage.removeItem('bt_current_empid'); }
+const USERS_FILE = path.join(__dirname, 'users.json');
+const DATA_FILE = path.join(__dirname, 'data.json');
 
-  // --- Registration/Login simplified for demo ---
-  function showLogin() {
-    app.innerHTML = `
-      <div class="centered">
-        <h2>Login</h2>
-        <select id="nameSel">${teamMembers.map(m=>`<option value="${m.empid}">${m.name}</option>`).join('')}</select>
-        <button class="btn" id="loginBtn">Login</button>
-      </div>`;
-    document.getElementById("loginBtn").onclick = () => {
-      const empid = document.getElementById("nameSel").value;
-      setCurrentEmpid(empid);
-      showDashboard();
+function load(file, fallback) {
+  try {
+    if (fs.existsSync(file)) {
+      return JSON.parse(fs.readFileSync(file));
+    }
+  } catch {}
+  fs.writeFileSync(file, JSON.stringify(fallback, null, 2));
+  return fallback;
+}
+
+let users = load(USERS_FILE, []);
+let breakData = load(DATA_FILE, {});
+
+// Create break entry for new user
+function ensureBreakData(name) {
+  if (!breakData[name]) {
+    breakData[name] = {
+      status: 'Working',
+      totalBreak: 0,
+      breakStart: null,
+      breaksCount: 0
     };
+    fs.writeFileSync(DATA_FILE, JSON.stringify(breakData, null, 2));
+  }
+}
+
+// SIGNUP
+app.post('/signup', (req, res) => {
+  const { name, email, password } = req.body;
+
+  if (!name || !email || !password) return res.json({ ok: false, message: 'Missing fields' });
+
+  if (users.find(u => u.email === email)) {
+    return res.json({ ok: false, message: 'User already exists' });
   }
 
-  // --- Dashboard display ---
-  function showDashboard() {
-    const empid = getCurrentEmpid();
-    if (!empid) return showLogin();
+  users.push({ name, email, password });
+  fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2));
 
-    app.innerHTML = `
-      <div class="dashboard">
-        <div style="display:flex;justify-content:space-between;align-items:center;">
-          <h2>Team Break Dashboard</h2>
-          <button class="btn" onclick="logout()">Logout</button>
-        </div>
-        <div id="teamStatus"></div>
-        <div class="break-controls" style="margin-top:20px;">
-          <button class="btn" id="startBtn">Start Break</button>
-          <button class="btn" id="endBtn">End Break</button>
-        </div>
-      </div>
-    `;
+  ensureBreakData(name);
 
-    document.getElementById("startBtn").onclick = startBreak;
-    document.getElementById("endBtn").onclick = endBreak;
+  res.json({ ok: true });
+});
 
-    // Listen for real-time updates
-    const teamRef = ref(db, "teamStatus");
-    onValue(teamRef, (snapshot) => {
-      const data = snapshot.val() || {};
-      renderTeamStatus(data);
+// LOGIN
+io.on('connection', socket => {
+
+  socket.on('login', ({ email, password }, cb) => {
+    const user = users.find(u => u.email === email && u.password === password);
+    if (!user) return cb({ ok: false, message: 'Invalid login' });
+    ensureBreakData(user.name);
+    cb({ ok: true, name: user.name });
+  });
+
+  socket.on('requestData', () => {
+    socket.emit('breakData', breakData);
+  });
+
+  // BREAK IN
+  socket.on('breakIn', ({ name, performer }, cb) => {
+    if (name !== performer) return cb({ ok: false, message: 'Unauthorized' });
+    let user = breakData[name];
+    if (!user) return cb({ ok: false });
+    if (user.status === 'On Break') return cb({ ok: false, message: 'Already on break' });
+    if (user.breaksCount >= 3) return cb({ ok: false, message: 'Max breaks reached' });
+
+    user.status = 'On Break';
+    user.breakStart = Date.now();
+    user.breaksCount++;
+
+    fs.writeFileSync(DATA_FILE, JSON.stringify(breakData, null, 2));
+    io.emit('breakData', breakData);
+    cb({ ok: true });
+  });
+
+  // BREAK OUT
+  socket.on('breakOut', ({ name, performer }, cb) => {
+    if (name !== performer) return cb({ ok: false });
+    let user = breakData[name];
+    if (!user || !user.breakStart) return cb({ ok: false });
+
+    const mins = Math.round((Date.now() - user.breakStart) / 60000);
+    user.totalBreak += mins;
+    if (user.totalBreak > 60) user.totalBreak = 60;
+
+    user.status = 'Working';
+    user.breakStart = null;
+
+    fs.writeFileSync(DATA_FILE, JSON.stringify(breakData, null, 2));
+    io.emit('breakData', breakData);
+    cb({ ok: true });
+  });
+});
+
+server.listen(3000, () => console.log('Server running on port 3000'));```
+
+=============================
+📌 **package.json**
+=============================
+```json
+{
+  "name": "break-tracker",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "socket.io": "^4.7.2"
+  }
+}```
+
+=============================
+📌 **data.json**
+=============================
+```json
+{}``` 
+
+=============================
+📌 **users.json**
+=============================
+```json
+[]``` 
+
+=============================
+📌 public/login.html
+=============================
+```html
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Login</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="/socket.io/socket.io.js"></script>
+</head>
+<body class="p-10">
+  <div class="max-w-md mx-auto bg-white p-6 shadow rounded">
+    <h2 class="text-2xl font-bold mb-4">Login</h2>
+
+    <input id="email" placeholder="Email" class="w-full p-2 border mb-3" />
+    <input id="password" type="password" placeholder="Password" class="w-full p-2 border mb-3" />
+
+    <button onclick="login()" class="bg-blue-600 text-white px-4 py-2">Login</button>
+
+    <p class="mt-4">New user? <a href="signup.html" class="text-blue-500">Signup</a></p>
+
+    <p id="err" class="text-red-500 mt-3"></p>
+  </div>
+
+<script>
+  const socket = io();
+
+  function login() {
+    let email = document.getElementById('email').value;
+    let password = document.getElementById('password').value;
+
+    socket.emit('login', { email, password }, (res) => {
+      if (!res.ok) return document.getElementById('err').textContent = res.message;
+
+      localStorage.setItem('user', res.name);
+      window.location.href = 'dashboard.html';
     });
   }
-
-  // --- Render team statuses ---
-  function renderTeamStatus(data) {
-    const currentEmpid = getCurrentEmpid();
-    let html = "<table><tr><th>Name</th><th>Status</th></tr>";
-    teamMembers.forEach(m => {
-      const status = data[m.empid]?.status || "Active";
-      const isCurrent = m.empid === currentEmpid;
-      html += `
-        <tr>
-          <td>${m.name}${isCurrent ? " (You)" : ""}</td>
-          <td style="color:${status==='Break' ? '#fa7540':'#42b242'}">${status}</td>
-        </tr>`;
-    });
-    html += "</table>";
-    document.getElementById("teamStatus").innerHTML = html;
-  }
-
-  // --- Start/End break handlers ---
-  async function startBreak() {
-    const empid = getCurrentEmpid();
-    if (!empid) return;
-    await update(ref(db, "teamStatus/" + empid), {
-      status: "Break",
-      updatedAt: Date.now()
-    });
-  }
-
-  async function endBreak() {
-    const empid = getCurrentEmpid();
-    if (!empid) return;
-    await update(ref(db, "teamStatus/" + empid), {
-      status: "Active",
-      updatedAt: Date.now()
-    });
-  }
-
-  // --- Logout ---
-  function logout() {
-    clearCurrentEmpid();
-    showLogin();
-  }
-
-  // --- Boot ---
-  if (getCurrentEmpid()) showDashboard();
-  else showLogin();
 </script>
+</body>
+</html>``` 
+
+=============================
+📌 public/signup.html
+=============================
+```html
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Signup</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="p-10">
+  <div class="max-w-md mx-auto bg-white p-6 shadow rounded">
+    <h2 class="text-2xl font-bold mb-4">Create Account</h2>
+
+    <input id="name" placeholder="Full Name" class="w-full p-2 border mb-3" />
+    <input id="email" placeholder="Email" class="w-full p-2 border mb-3" />
+    <input id="password" type="password" placeholder="Password" class="w-full p-2 border mb-3" />
+
+    <button onclick="signup()" class="bg-green-600 text-white px-4 py-2">Create Account</button>
+
+    <p id="err" class="text-red-500 mt-3"></p>
+  </div>
+
+<script>
+function signup() {
+  fetch('/signup', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      name: document.getElementById('name').value,
+      email: document.get
+
+````
